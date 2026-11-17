@@ -180,6 +180,15 @@ class EvaluateSplitAgent {
 
       __syncwarp();
     }
+
+    // Every observed category goes right while missing values go left. The category
+    // threshold -1 is a sentinel for this split when materializing the bit field.
+    auto non_missing = parent_sum - missing;
+    auto gain = evaluator.CalcSplitGain(param, nidx, fidx, rounding.ToFloatingPoint(missing),
+                                       rounding.ToFloatingPoint(non_missing));
+    if (threadIdx.x == 0) {
+      best_split->UpdateCat(gain, kLeftDir, -1, fidx, missing, non_missing);
+    }
   }
   /**
    * \brief Gather and update the best split.
@@ -252,6 +261,15 @@ class EvaluateSplitAgent {
       GradientPairInt64 right_sum = parent_sum - left_sum;
 
       PartitionUpdate(scan_begin, thread_active, false, it, left_sum, right_sum, best_split);
+    }
+
+    // All categories go right and missing values go left. For a partition split the
+    // largest threshold selects the complete sorted category range.
+    auto non_missing = parent_sum - missing;
+    auto gain = evaluator.CalcSplitGain(param, nidx, fidx, rounding.ToFloatingPoint(missing),
+                                       rounding.ToFloatingPoint(non_missing));
+    if (threadIdx.x == 0) {
+      best_split->UpdateCat(gain, kLeftDir, n_bins_feature - 1, fidx, missing, non_missing);
     }
   }
 };
@@ -331,7 +349,15 @@ __device__ void SetCategoricalSplit(const EvaluateSplitSharedInputs &shared_inpu
 
   // Simple case for one hot split
   if (common::UseOneHot(shared_inputs.FeatureBins(fidx), shared_inputs.param.max_cat_to_onehot)) {
-    out_cats.Set(common::AsCat(out_split.thresh));
+    if (out_split.thresh == -1) {
+      // Sentinel for sending every observed category to the right.
+      for (auto i = shared_inputs.feature_segments[fidx];
+           i < shared_inputs.feature_segments[fidx + 1]; ++i) {
+        out_cats.Set(common::AsCat(shared_inputs.feature_values[i]));
+      }
+    } else {
+      out_cats.Set(common::AsCat(out_split.thresh));
+    }
     return;
   }
 

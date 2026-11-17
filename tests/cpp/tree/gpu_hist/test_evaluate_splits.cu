@@ -138,9 +138,8 @@ TEST(GpuHist, PartitionBasic) {
     EXPECT_FLOAT_EQ(result.loss_chg, 0.0f);
     EXPECT_EQ(result.left_sum + result.right_sum, parent_sum);
   }
-  // With 3.0/3.0 missing values
-  // Forward, first 2 categories are selected, while the last one go to left along with missing
-  // value
+  // With 3.0/3.0 missing values, all observed categories go right and missing values go
+  // left.
   {
     auto parent_sum = quantiser.ToFixedPoint(GradientPairPrecise{0.0, 6.0});
     auto feature_histogram = ConvertToInteger(&ctx, {{-1.0, 1.0}, {-1.0, 1.0}, {-1.0, 1.0}});
@@ -148,7 +147,7 @@ TEST(GpuHist, PartitionBasic) {
                               dh::ToSpan(feature_histogram)};
     DeviceSplitCandidate result = evaluator.EvaluateSingleSplit(&ctx, input, shared_inputs).split;
     auto cats = std::bitset<32>(evaluator.GetHostNodeCats(input.nidx)[0]);
-    EXPECT_EQ(cats, std::bitset<32>("11000000000000000000000000000000"));
+    EXPECT_EQ(cats, std::bitset<32>("11100000000000000000000000000000"));
     EXPECT_EQ(result.dir, kLeftDir);
     EXPECT_EQ(result.left_sum + result.right_sum, parent_sum);
   }

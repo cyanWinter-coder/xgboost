@@ -14,6 +14,7 @@
 #include <numeric>           // for accumulate, iota
 #include <string>            // for to_string
 #include <tuple>             // for make_tuple
+#include <utility>           // for pair
 
 #include "../../../../src/common/random.h"              // for ColumnSampler
 #include "../../../../src/tree/hist/evaluate_splits.h"  // for HistEvaluator
@@ -316,13 +317,15 @@ TYPED_TEST(TestHistEvaluator, PartitionMissing) {
   this->cuts_ = MakeCutsForTest({0.0, 1.0, 2.0, 3.0}, {0, 4}, DeviceOrd::CPU());
   auto const &split =
       this->Evaluate({{{0.5, 0.5}, {0.5, 0.5}, {1.0, 1.0}, {1.0, 1.0}}}, {{-2.0, 3.0}});
-  EXPECT_NEAR(split.loss_chg, 2.97619f * this->kSplitTargets, kRtEps * this->kSplitTargets);
-  EXPECT_FALSE(split.DefaultLeft());
+  // Isolating missing values is better than selecting a suffix of categories.
+  EXPECT_NEAR(split.loss_chg, (25.0f / 6.0f) * this->kSplitTargets,
+              kRtEps * this->kSplitTargets);
+  EXPECT_TRUE(split.DefaultLeft());
   EXPECT_TRUE(std::isnan(split.split_value));
-  this->CheckCategories({true, false, false, false});
+  this->CheckCategories({true, true, true, true});
   for (bst_target_t t = 0; t < this->kSplitTargets; ++t) {
-    EXPECT_EQ(split.left_sum.at(t), GradientPairPrecise(2.5, 2.5));
-    EXPECT_EQ(split.right_sum.at(t), GradientPairPrecise(-1.5, 3.5));
+    EXPECT_EQ(split.left_sum.at(t), GradientPairPrecise(-2.0, 3.0));
+    EXPECT_EQ(split.right_sum.at(t), GradientPairPrecise(3.0, 3.0));
   }
   this->CheckApply();
 
@@ -367,5 +370,94 @@ TYPED_TEST(TestHistEvaluator, PartitionUnregularizedOrder) {
       this->Evaluate({{{-4.0, 1.0}, {-2.0, 3.0}, {-1.0, 1.0}}}, {}, {{"reg_lambda", "2"}});
   EXPECT_NEAR(split.loss_chg, 0.05f * this->kSplitTargets, kRtEps);
   this->CheckCategories({false, true, false});
+}
+
+TYPED_TEST(TestHistEvaluator, MissingVersusCategories) {
+  this->cuts_ = MakeCutsForTest({0.0, 1.0, 2.0, 3.0}, {0, 4}, DeviceOrd::CPU());
+  std::vector<GradientPairPrecise> hist({{2.0, 1.0}, {2.0, 1.0}, {2.0, 1.0}, {2.0, 1.0}});
+  auto const missing = GradientPairPrecise{-8.0, 4.0};
+
+  std::vector<std::pair<std::string, std::string>> const cases{
+      {"1", "2"}, {"1", "64"}, {"5", "64"}};
+  for (auto const &[max_cat_to_onehot, max_cat_threshold] : cases) {
+    SCOPED_TRACE(max_cat_to_onehot + max_cat_threshold);
+    auto split = this->Evaluate({hist}, {missing},
+                                {{"max_cat_to_onehot", max_cat_to_onehot},
+                                 {"max_cat_threshold", max_cat_threshold}});
+    EXPECT_FLOAT_EQ(split.loss_chg, 32.0f * this->kSplitTargets);
+    EXPECT_TRUE(std::isnan(split.split_value));
+    EXPECT_TRUE(split.DefaultLeft());
+    this->CheckCategories({true, true, true, true});
+    for (bst_target_t t = 0; t < this->kSplitTargets; ++t) {
+      EXPECT_EQ(split.left_sum.at(t), missing);
+      EXPECT_EQ(split.right_sum.at(t), GradientPairPrecise(8.0, 4.0));
+    }
+    this->CheckApply();
+  }
+}
+
+TYPED_TEST(TestHistEvaluator, MissingVersusCategoriesMonotone) {
+  this->cuts_ = MakeCutsForTest({0.0, 1.0, 2.0, 3.0}, {0, 4}, DeviceOrd::CPU());
+  for (auto direction : {1, -1}) {
+    SCOPED_TRACE(direction);
+    auto cat_grad = -2.0 * direction;
+    std::vector<GradientPairPrecise> hist(
+        {{cat_grad, 1.0}, {cat_grad, 1.0}, {cat_grad, 1.0}, {cat_grad, 1.0}});
+    auto missing = GradientPairPrecise{8.0 * direction, 4.0};
+    auto split = this->Evaluate({hist}, {missing},
+                                {{"max_cat_to_onehot", "1"},
+                                 {"monotone_constraints", direction > 0 ? "(1)" : "(-1)"}});
+    EXPECT_FLOAT_EQ(split.loss_chg, 32.0f * this->kSplitTargets);
+    EXPECT_TRUE(split.DefaultLeft());
+    this->CheckCategories({true, true, true, true});
+    this->CheckApply();
+  }
+}
+
+TYPED_TEST(TestHistEvaluator, ParallelDeterminism) {
+  this->ft_ = {FeatureType::kCategorical, FeatureType::kCategorical};
+  this->cuts_ = MakeCutsForTest({0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0}, {0, 4, 8},
+                                DeviceOrd::CPU());
+  std::vector<std::vector<GradientPairPrecise>> hist = {
+      {{1.0, 1.0}, {-2.0, 1.0}, {3.0, 1.0}, {-1.0, 1.0},
+       {0.5, 1.0}, {-0.5, 1.0}, {2.5, 1.0}, {-1.5, 1.0}}};
+  std::vector<GradientPairPrecise> missing{{-4.0, 2.0}};
+
+  for (auto max_cat_to_onehot : {"1", "8"}) {
+    SCOPED_TRACE(max_cat_to_onehot);
+    this->ctx_.nthread = 1;
+    auto single = this->Evaluate(hist, missing, {{"max_cat_to_onehot", max_cat_to_onehot}});
+    this->ctx_.nthread = 4;
+    auto parallel = this->Evaluate(hist, missing, {{"max_cat_to_onehot", max_cat_to_onehot}});
+
+    EXPECT_EQ(single.loss_chg, parallel.loss_chg);
+    EXPECT_EQ(single.SplitIndex(), parallel.SplitIndex());
+    ASSERT_EQ(std::isnan(single.split_value), std::isnan(parallel.split_value));
+    if (!std::isnan(single.split_value)) {
+      EXPECT_EQ(single.split_value, parallel.split_value);
+    }
+    EXPECT_EQ(single.DefaultLeft(), parallel.DefaultLeft());
+    EXPECT_EQ(single.is_cat, parallel.is_cat);
+    EXPECT_EQ(single.cat_bits, parallel.cat_bits);
+    EXPECT_EQ(single.left_sum, parallel.left_sum);
+    EXPECT_EQ(single.right_sum, parallel.right_sum);
+  }
+}
+
+TYPED_TEST(TestHistEvaluator, SparseCategoryCodes) {
+  this->cuts_ = MakeCutsForTest({1.0, 33.0, 40.0}, {0, 3}, DeviceOrd::CPU());
+  std::vector<GradientPairPrecise> hist({{0.0, 1.0}, {0.0, 1.0}, {10.0, 1.0}});
+
+  for (auto max_cat_to_onehot : {"1", "4"}) {
+    SCOPED_TRACE(max_cat_to_onehot);
+    auto split = this->Evaluate(
+        {hist}, {}, {{"max_cat_to_onehot", max_cat_to_onehot}, {"max_cat_threshold", "3"}});
+    common::KCatBitField bits{split.cat_bits};
+    ASSERT_EQ(split.cat_bits.size(), 2);
+    // A partition may store the complement of the selected left child.
+    EXPECT_NE(bits.Check(40), bits.Check(1));
+    EXPECT_EQ(bits.Check(33), bits.Check(1));
+    this->CheckApply();
+  }
 }
 }  // namespace xgboost::tree

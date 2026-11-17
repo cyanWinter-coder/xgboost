@@ -42,6 +42,93 @@ class HistEvaluator {
   Context const *ctx_;
 
  private:
+  /**
+   * @brief Storage needed to represent every category in a feature.
+   *
+   * Category codes are not required to be densely packed. Allocate from the largest code
+   * instead of the number of histogram bins so setting the split bits cannot write past
+   * the end of the bit field.
+   */
+  static std::size_t CategoryBitStorageSize(common::HistogramCuts const &cut,
+                                            bst_feature_t fidx) {
+    auto const &cut_ptr = cut.Ptrs();
+    auto const &cut_val = cut.Values();
+    std::size_t max_cat{0};
+    for (auto i = cut_ptr[fidx]; i < cut_ptr[fidx + 1]; ++i) {
+      max_cat = std::max(max_cat, static_cast<std::size_t>(common::AsCat(cut_val[i])));
+    }
+    return common::CatBitField::ComputeStorageSize(max_cat + 1);
+  }
+
+  void SetAllCategories(common::HistogramCuts const &cut, bst_feature_t fidx,
+                        SplitEntryT *p_best) const {
+    auto const &cut_ptr = cut.Ptrs();
+    auto const &cut_val = cut.Values();
+    p_best->cat_bits.assign(CategoryBitStorageSize(cut, fidx), 0);
+    common::CatBitField cat_bits{p_best->cat_bits};
+    for (auto i = cut_ptr[fidx]; i < cut_ptr[fidx + 1]; ++i) {
+      cat_bits.Set(common::AsCat(cut_val[i]));
+    }
+  }
+
+  /**
+   * @brief Enumerate the split that sends every observed category to the right child and
+   *        only missing values to the left child.
+   *
+   * Categorical splits store selected categories on the right. Consequently, this is the
+   * representable orientation of the "missing versus non-missing" split. It matters when
+   * missing values carry a strong signal and is required for a complete categorical
+   * split search.
+   */
+  template <bool kSingleTarget>
+  void EvaluateMissingOnly(common::HistogramCuts const &cut, bst_feature_t fidx,
+                           linalg::VectorView<GradientPairPrecise const> parent_sum,
+                           linalg::VectorView<GradientPairPrecise const> non_missing_sum,
+                           double parent_gain, bst_node_t nidx,
+                           TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
+                           SplitEntryT *p_best) const {
+    auto n_split_targets = kSingleTarget ? 1 : parent_sum.Size();
+    std::array<GradientPairPrecise, 2> single_sum{};
+    auto const padding = common::DivRoundUp(std::size_t{64}, sizeof(GradientPairPrecise));
+    std::vector<GradientPairPrecise> sum(kSingleTarget ? 0 : 2 * n_split_targets + 2 * padding);
+    auto *data = kSingleTarget ? single_sum.data() : sum.data() + padding;
+    auto left_sum = linalg::MakeVec(data, n_split_targets);
+    auto right_sum = linalg::MakeVec(data + n_split_targets, n_split_targets);
+
+    for (bst_target_t t = 0; t < n_split_targets; ++t) {
+      right_sum(t) = non_missing_sum(t);
+      left_sum(t) = parent_sum(t) - right_sum(t);
+    }
+
+    auto gain = evaluator.CalcSplitGain(*param_, nidx, fidx, left_sum, right_sum) - parent_gain;
+    if (p_best->Update(gain, fidx, std::numeric_limits<float>::quiet_NaN(), true, true, left_sum,
+                       right_sum)) {
+      this->SetAllCategories(cut, fidx, p_best);
+    }
+  }
+
+  template <bool kSingleTarget>
+  void EnumerateMissingOnly(common::HistogramCuts const &cut, bst_feature_t fidx,
+                            common::Span<common::ConstGHistRow> hist,
+                            linalg::VectorView<GradientPairPrecise const> parent_sum,
+                            double parent_gain, bst_node_t nidx,
+                            TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
+                            SplitEntryT *p_best) const {
+    auto const &cut_ptr = cut.Ptrs();
+    auto n_split_targets = kSingleTarget ? 1 : hist.size();
+
+    std::array<GradientPairPrecise, 1> single_sum{};
+    std::vector<GradientPairPrecise> sum(kSingleTarget ? 0 : n_split_targets);
+    auto *data = kSingleTarget ? single_sum.data() : sum.data();
+    auto feature_sum = linalg::MakeVec(data, n_split_targets);
+    for (bst_target_t t = 0; t < n_split_targets; ++t) {
+      auto f_hist = hist[t].subspan(cut_ptr[fidx], cut_ptr[fidx + 1] - cut_ptr[fidx]);
+      feature_sum(t) = std::accumulate(f_hist.begin(), f_hist.end(), GradientPairPrecise{});
+    }
+    this->EvaluateMissingOnly<kSingleTarget>(cut, fidx, parent_sum, feature_sum, parent_gain, nidx,
+                                             evaluator, p_best);
+  }
+
   // Enumerate/Scan the split values of specific feature
   template <bst_bin_t d_step, bool kSingleTarget>
   bool EnumerateSplitImpl(common::HistogramCuts const &cut, bst_feature_t fidx,
@@ -200,10 +287,10 @@ class HistEvaluator {
     }
 
     if (updated) {
-      auto n = common::CatBitField::ComputeStorageSize(n_bins + 1);
+      auto n = CategoryBitStorageSize(cut, fidx);
       p_best->cat_bits.assign(n, 0);
       common::CatBitField cat_bits{p_best->cat_bits};
-      cat_bits.Set(p_best->split_value);
+      cat_bits.Set(common::AsCat(p_best->split_value));
     }
   }
 
@@ -228,7 +315,7 @@ class HistEvaluator {
                      common::Span<common::ConstGHistRow> hist, bst_feature_t fidx,
                      linalg::VectorView<GradientPairPrecise const> parent_sum, double parent_gain,
                      bst_node_t nidx, TreeEvaluator::SplitEvaluator<TrainParam> const &evaluator,
-                     SplitEntryT *p_best) const {
+                     SplitEntryT *p_best, bool include_all = false) const {
     static_assert(d_step == +1 || d_step == -1, "Invalid step.");
     auto n_split_targets = kSingleTarget ? 1 : hist.size();
 
@@ -243,7 +330,7 @@ class HistEvaluator {
     bst_bin_t it_begin, it_end;
     if (d_step > 0) {
       it_begin = f_begin;
-      it_end = it_begin + n_bins - 1;
+      it_end = it_begin + n_bins - 1 + static_cast<bst_bin_t>(include_all);
     } else {
       it_begin = f_end - 1;
       it_end = it_begin - n_bins + 1;
@@ -281,7 +368,7 @@ class HistEvaluator {
     }
 
     if (best_thresh != -1) {
-      auto n = common::CatBitField::ComputeStorageSize(n_bins_feature);
+      auto n = CategoryBitStorageSize(cut, fidx);
       p_best->cat_bits.assign(n, 0);
       common::CatBitField cat_bits{p_best->cat_bits};
       bst_bin_t partition = d_step == 1 ? (best_thresh - it_begin + 1) : (best_thresh - f_begin);
@@ -389,21 +476,32 @@ class HistEvaluator {
             if (common::UseOneHot(n_bins, param_->max_cat_to_onehot)) {
               this->EnumerateOneHot<kSingleTarget>(cut, fidx, node_hist, parent_sum, parent_gain,
                                                    entry->nid, evaluator, best);
+              this->EnumerateMissingOnly<kSingleTarget>(cut, fidx, node_hist, parent_sum,
+                                                        parent_gain, entry->nid, evaluator, best);
               continue;
             }
 
             // Partition split
             std::vector<double> scores(n_bins);
+            auto include_all = param_->max_cat_threshold >= n_bins;
+            std::vector<GradientPairPrecise> feature_sum(include_all ? 0 : n_split_targets);
             for (std::size_t bin_idx = 0; bin_idx < n_bins; ++bin_idx) {
               auto bin = cut_ptr[fidx] + bin_idx;
               if (n_split_targets == 1) {
+                if (!include_all) {
+                  feature_sum[0] += node_hist[0][bin];
+                }
                 scores[bin_idx] = evaluator.CalcWeightCat(node_hist[0][bin]);
                 continue;
               }
               // s_c = w_p^T w_c. Since we care only about the ordering, no need to divide the norm.
               double sc = 0.0;
               for (std::size_t t = 0; t < n_split_targets; ++t) {
-                sc += parent_weight[t] * evaluator.CalcWeightCat(node_hist[t][bin]);
+                auto const &bin_sum = node_hist[t][bin];
+                if (!include_all) {
+                  feature_sum[t] += bin_sum;
+                }
+                sc += parent_weight[t] * evaluator.CalcWeightCat(bin_sum);
               }
               scores[bin_idx] = sc;
             }
@@ -414,9 +512,15 @@ class HistEvaluator {
                              [&](std::size_t l, std::size_t r) { return scores[l] < scores[r]; });
 
             this->EnumeratePart<+1, kSingleTarget>(cut, sorted_idx, node_hist, fidx, parent_sum,
-                                                   parent_gain, entry->nid, evaluator, best);
+                                                   parent_gain, entry->nid, evaluator, best,
+                                                   include_all);
             this->EnumeratePart<-1, kSingleTarget>(cut, sorted_idx, node_hist, fidx, parent_sum,
                                                    parent_gain, entry->nid, evaluator, best);
+            if (!include_all) {
+              this->EvaluateMissingOnly<kSingleTarget>(
+                  cut, fidx, parent_sum, linalg::MakeVec(feature_sum.data(), feature_sum.size()),
+                  parent_gain, entry->nid, evaluator, best);
+            }
           }
         }));
 

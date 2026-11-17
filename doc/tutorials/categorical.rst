@@ -94,6 +94,38 @@ according to these sorted values. One of the related parameters for XGBoost is
 used for each feature. Set ``max_cat_to_onehot=1`` to use partitioning for all categorical
 features. See :ref:`cat-param` for details.
 
+*********************
+Missing Values
+*********************
+
+Missing values do not occupy a histogram bin. During split evaluation XGBoost accounts for
+their gradients and Hessians separately and learns the default child together with the
+category partition. The search covers one-hot splits, contiguous partitions, and the
+special case where every observed category goes to one child and only missing values go
+to the other. The latter is reported as a categorical split whose category list contains
+all observed categories.
+
+The learned direction is available from the ``missing`` field in the JSON/text tree dump
+and from :meth:`~xgboost.Booster.trees_to_dataframe`. Missing values are routed to that
+child at prediction time; unseen categories that are not missing continue to follow the
+category membership test.
+
+When a monotone constraint is applied to a categorical feature, XGBoost compares the
+weights of the two children, since category codes themselves are not ordered. The same
+default-direction and category-partition candidates are evaluated, and candidates whose
+child weights violate the constraint are rejected. Note that a serialized categorical
+split stores the categories routed to the right child. For the missing-versus-categories
+case this means the representable orientation is "all observed categories right, missing
+left"; the opposite orientation has the same unconstrained gain but is not represented as
+an empty category set.
+
+To run the focused C++ and Python tests:
+
+.. code-block:: bash
+
+  ./build/testxgboost --gtest_filter='*HistEvaluator*:*CPUHistogram*'
+  python -m pytest tests/python/test_categorical_missing.py
+
 ===========
 Vector Leaf
 ===========

@@ -92,6 +92,20 @@ Some other examples:
    split candidates, in which case no split is made. To reduce the effect, you may want to
    increase the ``max_bin`` parameter to consider more split candidates.
 
+For categorical features, missing values are evaluated together with the category
+partition and the default child is learned from the data. A monotone constraint on a
+categorical feature compares the weights of the left and right children rather than the
+numeric order of category codes. Candidates whose child weights violate the requested
+direction are rejected by the histogram split evaluator. See :doc:`categorical` for the
+representable default-direction cases.
+
+The focused tests for the combined categorical, missing-value, and monotone paths are:
+
+.. code-block:: bash
+
+  ./build/testxgboost --gtest_filter='*HistEvaluator*'
+  python -m pytest tests/python/test_categorical_missing.py
+
 ===========
 Vector Leaf
 ===========

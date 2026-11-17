@@ -424,6 +424,56 @@ TEST(CPUHistogram, BuildHist) {
   TestBuildHistogram(&ctx, false, true);
 }
 
+TEST(CPUHistogram, BuildHistParallelDeterminism) {
+  auto build = [](std::int32_t nthreads) {
+    Context ctx;
+    ctx.nthread = nthreads;
+    std::size_t constexpr kNRows = 64, kNCols = 32;
+    bst_bin_t constexpr kMaxBins = 16;
+    auto p_fmat = RandomDataGenerator(kNRows, kNCols, 0.75).Seed(7).GenerateDMatrix();
+    auto const &gmat =
+        *(p_fmat->GetBatches<GHistIndexMatrix>(&ctx, BatchParam{kMaxBins, 0.5}).begin());
+
+    std::vector<GradientPair> gpair(kNRows);
+    for (std::size_t i = 0; i < gpair.size(); ++i) {
+      auto value = static_cast<float>(i + 1);
+      gpair[i] = GradientPair{value * 0.25f, value * 0.5f};
+    }
+
+    HistMakerTrainParam hist_param;
+    HistogramBuilder histogram;
+    histogram.Reset(&ctx, gmat.cut.TotalBins(), {kMaxBins, 0.5}, false, &hist_param);
+
+    common::RowSetCollection row_set_collection;
+    std::vector<bst_idx_t> &row_indices = *row_set_collection.Data();
+    row_indices.resize(kNRows);
+    std::iota(row_indices.begin(), row_indices.end(), 0);
+    row_set_collection.Init();
+
+    RegTree tree;
+    std::vector<bst_node_t> nodes{RegTree::kRoot};
+    std::vector<bst_node_t> nodes_to_sub;
+    histogram.AddHistRows(tree.HostScView(), &nodes, &nodes_to_sub, false);
+    common::BlockedSpace2d space{
+        1, [&](std::size_t) { return row_set_collection[0].Size(); }, 256};
+    for (auto const &gidx : p_fmat->GetBatches<GHistIndexMatrix>(&ctx, {kMaxBins, 0.5})) {
+      histogram.BuildHist(0, space, gidx, row_set_collection, nodes,
+                          linalg::MakeTensorView(&ctx, gpair, gpair.size()), false);
+    }
+    histogram.SyncHistogram(&ctx, tree.HostScView(), nodes, {});
+
+    auto hist = histogram.Histogram()[RegTree::kRoot];
+    return std::vector<GradientPairPrecise>{hist.begin(), hist.end()};
+  };
+
+  auto single = build(1);
+  auto parallel = build(4);
+  ASSERT_EQ(single.size(), parallel.size());
+  for (std::size_t i = 0; i < single.size(); ++i) {
+    EXPECT_EQ(single[i], parallel[i]);
+  }
+}
+
 namespace {
 template <typename GradientSumT>
 void ValidateCategoricalHistogram(size_t n_categories, common::Span<GradientSumT> onehot,
